@@ -2,7 +2,7 @@ name: Weekly Keepa Pull
 
 on:
   schedule:
-    - cron: '0 13 * * 1'   # Every Monday at 1pm UTC — adjust for your timezone
+    - cron: '0 13 * * 0'   # Every Monday at 1pm UTC — adjust for your timezone
   workflow_dispatch:        # Adds a manual "Run workflow" button in the Actions tab
 
 jobs:
