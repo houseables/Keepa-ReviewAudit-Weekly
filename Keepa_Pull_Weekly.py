@@ -40,6 +40,7 @@ ASIN_FILE = 'asins.txt'
 
 DATE_STR = datetime.today().strftime('%m/%d/%Y')
 DELAY_SECONDS = 13  # ~1 token/13 sec = 5/min, safe for 1 token per product
+MAX_TOKEN_WAIT_MINUTES = 30  # safety cap — only skips an ASIN if refill takes longer than this
 
 RATING_SHEET_NAME = 'Star Ratings'
 REVIEW_SHEET_NAME = 'Review Counts'
@@ -108,30 +109,57 @@ def check_token_status():
 
 
 # ---- Component 3: Batch loop over ASINs ----
+def wait_for_token_refill(tokens_left, refill_rate):
+    """If we're out of tokens, wait for them to regenerate rather than skipping
+    the ASIN — tokens refill continuously, and the per-call delay already gives
+    them time to recover. Only gives up (returns whatever it has) if refill
+    takes longer than MAX_TOKEN_WAIT_MINUTES, as a safety net against a stuck
+    account or an unreachable API."""
+    waited_seconds = 0
+    while tokens_left is not None and tokens_left < 1:
+        wait_seconds = max(60 / refill_rate, 5) if refill_rate else 30
+
+        if waited_seconds + wait_seconds > MAX_TOKEN_WAIT_MINUTES * 60:
+            print(
+                f'  Waited {MAX_TOKEN_WAIT_MINUTES} min for a token refill with no luck — '
+                f'skipping this ASIN for now, it will be picked up next run.'
+            )
+            return tokens_left
+
+        print(f'  Out of tokens — waiting ~{wait_seconds:.0f}s for a refill...', end=' ')
+        time.sleep(wait_seconds)
+        waited_seconds += wait_seconds
+
+        tokens_left, _, refill_rate = check_token_status()
+        print(f'now at {tokens_left} tokens.')
+
+    return tokens_left
+
+
 def fetch_keepa_data(asins):
     """Pull rating + review count for each ASIN. Returns dict asin -> (rating, review_count).
-    Checks token balance before starting and trims the list if there isn't
-    enough to cover every ASIN, so the run finishes cleanly rather than
-    erroring out partway through."""
+    If tokens run low mid-run, waits for them to regenerate (tokens refill
+    continuously, and the built-in delay between calls already helps) rather
+    than skipping ASINs outright."""
 
     tokens_left, refill_in_ms, refill_rate = check_token_status()
     if tokens_left is not None:
-        print(f'Keepa tokens available: {tokens_left}')
+        print(f'Keepa tokens available: {tokens_left} (refill rate ~{refill_rate}/min)')
         if tokens_left < len(asins):
-            refill_min = round(refill_in_ms / 60000, 1) if refill_in_ms else '?'
             print(
-                f'WARNING: Only {tokens_left} tokens available but {len(asins)} ASINs are queued '
-                f'(refill rate ~{refill_rate}/min, next refill in ~{refill_min} min). '
-                f'Processing the first {tokens_left} ASINs this run — the rest will simply '
-                f'be missing from this week\'s column.'
+                f'Only {tokens_left} tokens on hand for {len(asins)} ASINs queued — tokens '
+                f'regenerate continuously and there\'s a {DELAY_SECONDS}s delay between calls, '
+                f'so the script will wait for refills as needed rather than skipping ASINs.'
             )
-            asins = asins[:tokens_left]
     else:
         print('Skipping token pre-check (endpoint unreachable) — proceeding normally.')
 
     results = {}
     for i, asin in enumerate(asins):
         print(f'[{i + 1}/{len(asins)}] Pulling {asin}...', end=' ')
+
+        if tokens_left is not None and tokens_left < 1:
+            tokens_left = wait_for_token_refill(tokens_left, refill_rate)
 
         try:
             url = f'https://api.keepa.com/product?key={API_KEY}&domain=1&asin={asin}&rating=1'
@@ -143,13 +171,15 @@ def fetch_keepa_data(asins):
             else:
                 data = response.json()
                 products = data.get('products')
+                tokens_left = data.get('tokensLeft', tokens_left)  # keep the running count fresh
+
                 if not products:
                     print('No data returned')
                     results[asin] = ('', '')
                 else:
                     rating, reviews = parse_product(products[0])
                     results[asin] = (rating, reviews)
-                    print(f'Done — rating={rating}, reviews={reviews}')
+                    print(f'Done — rating={rating}, reviews={reviews} (tokens left: {tokens_left})')
 
         except Exception as e:
             print(f'Error: {e}')
@@ -242,6 +272,20 @@ def write_column(ws, values_by_asin, header):
     ws.update(f'{letter}1', col_values)
 
 
+def center_align_sheet(ws, start_col='F'):
+    """Center-align cell contents (header row included) from `start_col` onward —
+    the dated Keepa data columns — leaving columns A-E (ASIN + reference fields)
+    untouched."""
+    last_row = len(ws.col_values(1))
+    last_col_index = len(ws.row_values(1))
+    if last_row == 0 or last_col_index < 6:
+        return  # nothing at or past column F yet
+
+    last_col = col_letter(last_col_index)
+    data_range = f'{start_col}1:{last_col}{last_row}'
+    ws.format(data_range, {'horizontalAlignment': 'CENTER'})
+
+
 def sort_by_fba_sku(ws):
     """Sort all data rows by FBA SKU (column B), keeping the header row fixed in place."""
     last_row = len(ws.col_values(1))
@@ -285,6 +329,10 @@ def main():
     print('Sorting rows by FBA SKU...')
     sort_by_fba_sku(rating_ws)
     sort_by_fba_sku(review_ws)
+
+    print('Center-aligning all columns...')
+    center_align_sheet(rating_ws)
+    center_align_sheet(review_ws)
 
     print(f'\nComplete. "{RATING_SHEET_NAME}" and "{REVIEW_SHEET_NAME}" updated for {DATE_STR}')
 
